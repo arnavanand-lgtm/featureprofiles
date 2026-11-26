@@ -140,3 +140,43 @@ func BenchmarkPeriodicHookCost(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkMissingPrefixTracking compares how InitialSyncStoppingCondition
+// records missing prefixes today (a new map[string]bool holding every missing
+// prefix, built on each periodic check) with a reused slice. The cache is empty,
+// as at the start of initial sync, so every wanted prefix is missing. The same
+// pattern applies to failingNHPrefixes.
+//
+//	go test -run='^$' -bench=MissingPrefixTracking -benchmem ./internal/telemetry/aftcache/
+func BenchmarkMissingPrefixTracking(b *testing.B) {
+	for _, n := range []int{200_000, 2_000_000} {
+		_, want := buildPrefixScaleCache(b, n)
+		got := map[string]uint64{} // nothing received yet
+
+		b.Run(fmt.Sprintf("newMapEachCheck/%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				missing := make(map[string]bool)
+				for p := range want {
+					if _, ok := got[p]; !ok {
+						missing[p] = true
+					}
+				}
+				benchmarkSink = len(missing)
+			}
+		})
+		b.Run(fmt.Sprintf("reusedSlice/%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			var missing []string
+			for i := 0; i < b.N; i++ {
+				missing = missing[:0]
+				for p := range want {
+					if _, ok := got[p]; !ok {
+						missing = append(missing, p)
+					}
+				}
+				benchmarkSink = len(missing)
+			}
+		})
+	}
+}
