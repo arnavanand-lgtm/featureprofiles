@@ -15,8 +15,9 @@
 package pmtu_handing_test
 
 import (
+	"errors"
 	"fmt"
-	"log"
+	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -51,6 +52,7 @@ const (
 	ipv6PrefixLen           = 126
 	mtuSrc                  = 9216
 	mtuDst                  = 1514
+	captureDuration         = 5 * time.Second
 	trafficRunDuration      = 15 * time.Second
 	trafficStopWaitDuration = 10 * time.Second
 	tgWaitDuration          = 30 * time.Second
@@ -58,6 +60,7 @@ const (
 	subInterfaceIndex       = 0
 	lineRatePrecentage      = 50
 	tolerance               = 5000
+	minICMPPacketCount      = 3
 )
 
 type testDefinition struct {
@@ -292,66 +295,72 @@ func getFTCompatibleComponentName(t *testing.T, vendor ondatra.Vendor, component
 }
 
 func captureAndValidateICMPPacketsReceived(t *testing.T, td testData, packetVal *packetValidation) {
+	t.Helper()
 	td.otgConfig.Captures().Clear()
 	bytes := td.otg.GetCapture(t, gosnappi.NewCaptureRequest().SetPortName(packetVal.portName))
 	f, err := os.CreateTemp("", "pcap")
 	if err != nil {
-		t.Fatalf("ERROR: Could not create temporary pcap file: %v\n", err)
+		t.Fatalf("os.CreateTemp(%q, %q) failed: %v", "", "pcap", err)
 	}
+	defer os.Remove(f.Name())
 	if _, err := f.Write(bytes); err != nil {
-		t.Fatalf("ERROR: Could not write bytes to pcap file: %v\n", err)
+		f.Close()
+		t.Fatalf("Write(%q) failed: %v", f.Name(), err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close(%q) failed: %v", f.Name(), err)
+	}
 	handle, err := pcap.OpenOffline(f.Name())
 	if err != nil {
-		log.Fatal(err)
+		t.Fatalf("pcap.OpenOffline(%q) failed: %v", f.Name(), err)
 	}
 	defer handle.Close()
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	t.Helper()
 
 	count := 0
-	for packet := range packetSource.Packets() {
-		if td.flowProto == ipv4 {
-			ipLayer := packet.Layer(layers.LayerTypeIPv4)
-			if ipLayer == nil {
+	for count < minICMPPacketCount {
+		packet, err := packetSource.NextPacket()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("packetSource.NextPacket() failed: %v", err)
+		}
+		switch td.flowProto {
+		case ipv4:
+			if packet.Layer(layers.LayerTypeIPv4) == nil {
 				continue
 			}
-			ipPacket, _ := ipLayer.(*layers.IPv4)
-			innerPacket := gopacket.NewPacket(ipPacket.Payload, ipPacket.NextLayerType(), gopacket.Default)
-			ipInnerLayer := innerPacket.Layer(layers.LayerTypeICMPv4)
+			ipInnerLayer := packet.Layer(layers.LayerTypeICMPv4)
 			if ipInnerLayer == nil {
-				t.Error("No ICMPv4 Echo Reply found")
+				continue
 			}
-			ipInnerPacket, _ := ipInnerLayer.(*layers.ICMPv4)
-			if ipInnerPacket.TypeCode != layers.ICMPv4TypeDestinationUnreachable && ipInnerPacket.TypeCode != layers.ICMPv4CodeFragmentationNeeded {
+			icmpPacket, _ := ipInnerLayer.(*layers.ICMPv4)
+			isFragNeeded := icmpPacket.TypeCode.Type() == layers.ICMPv4TypeDestinationUnreachable && icmpPacket.TypeCode.Code() == layers.ICMPv4CodeFragmentationNeeded
+			if isFragNeeded {
 				t.Logf("PASS: received ICMPv4 type-3, code-4")
-				count = count + 1
-			} else {
-				t.Errorf("FAIL: did not received ICMPv4 type-3, code-4")
+				count++
 			}
-		} else if td.flowProto == ipv6 {
-			ipLayer := packet.Layer(layers.LayerTypeIPv6)
-			if ipLayer == nil {
+		case ipv6:
+			if packet.Layer(layers.LayerTypeIPv6) == nil {
 				continue
 			}
-			ipPacket, _ := ipLayer.(*layers.IPv6)
-			innerPacket := gopacket.NewPacket(ipPacket.Payload, ipPacket.NextLayerType(), gopacket.Default)
-			ipInnerLayer := innerPacket.Layer(layers.LayerTypeICMPv6)
+			ipInnerLayer := packet.Layer(layers.LayerTypeICMPv6)
 			if ipInnerLayer == nil {
-				t.Error("No ICMPv6 Echo Reply found")
+				continue
 			}
-			ipInnerPacket, _ := ipInnerLayer.(*layers.ICMPv6)
-			if ipInnerPacket.TypeCode != layers.ICMPv6TypePacketTooBig && ipInnerPacket.TypeCode != layers.ICMPv6CodeNoRouteToDst {
+			icmpPacket, _ := ipInnerLayer.(*layers.ICMPv6)
+			isPacketTooBig := icmpPacket.TypeCode.Type() == layers.ICMPv6TypePacketTooBig && icmpPacket.TypeCode.Code() == 0
+			if isPacketTooBig {
 				t.Logf("PASS: received ICMPv6 type-2, code-0")
-				count = count + 1
-			} else {
-				t.Errorf("FAIL: did not received ICMPv6 type-2, code-0")
+				count++
 			}
+		default:
+			t.Fatalf("unsupported flow protocol %q", td.flowProto)
 		}
-		if count == 3 {
-			break
-		}
+	}
+	if count < minICMPPacketCount {
+		t.Errorf("captureAndValidateICMPPacketsReceived(%q, %q) matched %d ICMP packets, want at least %d", packetVal.portName, td.flowProto, count, minICMPPacketCount)
 	}
 
 	td.otgConfig.Captures().Clear()
@@ -379,10 +388,13 @@ func createFlowAndVerifyTraffic(t *testing.T, td testData, tt testDefinition, wa
 	cs := otgutils.StartCapture(t, td.otg)
 	defer otgutils.StopCapture(t, td.otg, cs)
 	td.otg.StartTraffic(t)
-	time.Sleep(trafficRunDuration)
+	time.Sleep(captureDuration)
+	// Stop capture early so KENG stays well under its 30 MiB per-port limit while
+	// traffic continues for the full duration to exercise drop and CPU counters.
+	otgutils.StopCapture(t, td.otg, cs)
+	time.Sleep(trafficRunDuration - captureDuration)
 	td.otg.StopTraffic(t)
 	time.Sleep(trafficStopWaitDuration)
-	otgutils.StopCapture(t, td.otg, cs)
 	otgutils.LogFlowMetrics(t, td.otg, td.otgConfig)
 	otgutils.LogPortMetrics(t, td.otg, td.otgConfig)
 	flow := gnmi.OTG().Flow(tt.name)
